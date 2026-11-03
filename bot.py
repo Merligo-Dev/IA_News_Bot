@@ -2,6 +2,7 @@
 """
 Bot de veille IA (LLM & Génération d'Images) pour Telegram.
 Exécuté automatiquement chaque jour via GitHub Actions.
+Envoie deux messages distincts et complets avec liens directs cliquables.
 """
 
 import os
@@ -16,27 +17,32 @@ from dateutil import parser as date_parser
 
 # Configuration des flux RSS spécialisés
 RSS_FEEDS = [
-    # --- LLM & Modèles de Langage ---
+    # --- Catégorie LLM & Modèles de Langage ---
     {"category": "LLM", "source": "OpenAI News", "url": "https://openai.com/news/rss.xml"},
     {"category": "LLM", "source": "Hugging Face Blog", "url": "https://huggingface.co/blog/feed.xml"},
     {"category": "LLM", "source": "Google DeepMind Blog", "url": "https://deepmind.google/blog/rss.xml"},
     {"category": "LLM", "source": "Reddit r/LocalLLaMA", "url": "https://www.reddit.com/r/LocalLLaMA/top/.rss?t=day"},
-    
-    # --- Image & Vidéo Générative ---
+    {"category": "LLM", "source": "ArXiv cs.CL (Langage)", "url": "https://rss.arxiv.org/rss/cs.CL"},
+
+    # --- Catégorie Image & Vidéo Générative ---
     {"category": "Image", "source": "Stability AI News", "url": "https://stability.ai/news?format=rss"},
     {"category": "Image", "source": "Reddit r/StableDiffusion", "url": "https://www.reddit.com/r/StableDiffusion/top/.rss?t=day"},
     {"category": "Image", "source": "ComfyUI Releases", "url": "https://github.com/comfyanonymous/ComfyUI/releases.atom"},
-    
-    # --- Recherche & Open Source Global ---
-    {"category": "Research", "source": "ArXiv cs.CL (Langage)", "url": "https://rss.arxiv.org/rss/cs.CL"},
-    {"category": "Research", "source": "ArXiv cs.CV (Vision)", "url": "https://rss.arxiv.org/rss/cs.CV"},
+    {"category": "Image", "source": "ArXiv cs.CV (Vision)", "url": "https://rss.arxiv.org/rss/cs.CV"},
 ]
 
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) IANewsBot/1.0"
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+REDDIT_HEADERS = {
+    "User-Agent": "python:ia-news-bot:v1.2 (by /u/MerligoDev)"
+}
 
 
-def fetch_recent_articles(hours_back: int = 30, max_per_feed: int = 4):
-    """Récupère les articles récents des flux RSS."""
+def fetch_recent_articles(hours_back: int = 36, max_per_feed: int = 5):
+    """Récupère les articles récents des flux RSS avec headers adaptés."""
     cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours_back)
     collected_articles = []
 
@@ -47,9 +53,15 @@ def fetch_recent_articles(hours_back: int = 30, max_per_feed: int = 4):
         category = feed_info["category"]
         source_name = feed_info["source"]
 
+        headers = REDDIT_HEADERS if "reddit.com" in url else DEFAULT_HEADERS
+
         try:
-            headers = {"User-Agent": USER_AGENT}
             response = requests.get(url, headers=headers, timeout=12)
+            if response.status_code == 429:
+                print(f"[-] Rate limit (429) sur {source_name}, pause et retry...")
+                time.sleep(2)
+                response = requests.get(url, headers=headers, timeout=15)
+
             if response.status_code != 200:
                 print(f"[-] Erreur HTTP {response.status_code} sur {source_name}")
                 continue
@@ -63,16 +75,13 @@ def fetch_recent_articles(hours_back: int = 30, max_per_feed: int = 4):
 
                 # Extraction de la date de publication
                 pub_date = None
-                if hasattr(entry, "published"):
-                    try:
-                        pub_date = date_parser.parse(entry.published)
-                    except Exception:
-                        pass
-                elif hasattr(entry, "updated"):
-                    try:
-                        pub_date = date_parser.parse(entry.updated)
-                    except Exception:
-                        pass
+                for date_field in ["published", "updated", "pubDate"]:
+                    if hasattr(entry, date_field):
+                        try:
+                            pub_date = date_parser.parse(getattr(entry, date_field))
+                            break
+                        except Exception:
+                            pass
 
                 # Normalisation en UTC
                 if pub_date:
@@ -107,25 +116,18 @@ def fetch_recent_articles(hours_back: int = 30, max_per_feed: int = 4):
 
 
 def sanitize_telegram_html(text: str) -> str:
-    """
-    Assure la conformité absolue du code HTML avec l'API Telegram.
-    - Supprime les blocs de code markdown (```html)
-    - Convertit le markdown résiduel (**gras**, [lien](url)) en HTML
-    - Échappe correctement &, <, > dans le texte normal
-    - Ferme automatiquement les balises HTML orphelines
-    """
-    # 1. Enlever les balises de code Markdown au début et à la fin
+    """Assure la conformité absolue du code HTML avec Telegram."""
     text = text.strip()
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z]*\s*\n?", "", text)
         text = re.sub(r"\n?\s*```$", "", text)
     text = text.strip()
 
-    # 2. Conversion de résidus markdown fréquents
+    # Convertir d'éventuels résidus markdown
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r'<a href="\2">\1</a>', text)
 
-    # 3. Découpage par balises HTML autorisées par Telegram
+    # Découpage par balises HTML autorisées
     allowed_tag_pattern = re.compile(
         r"(</?(?:b|i|u|s|code|pre|blockquote)>|<a\s+href=[\"'][^\"']*[\"']>|</a>)",
         re.IGNORECASE
@@ -157,80 +159,26 @@ def sanitize_telegram_html(text: str) -> str:
                 open_tags.append(tag_name)
                 sanitized_parts.append(token)
         else:
-            # Échappement des caractères réservés hors balises
             unescaped = html.unescape(token)
             escaped = html.escape(unescaped, quote=False)
             sanitized_parts.append(escaped)
 
-    # Fermeture de sécurité de toute balise restée ouverte
     while open_tags:
         sanitized_parts.append(f"</{open_tags.pop()}>")
 
     return "".join(sanitized_parts)
 
 
-def generate_telegram_summary_gemini(articles, gemini_api_key: str):
-    """Appelle l'API Gemini pour générer une synthèse au format HTML Telegram."""
-    if not articles:
-        return "Aucune nouvelle actualité majeure détectée lors des dernières 24h."
-
-    articles_text = ""
-    for idx, art in enumerate(articles, 1):
-        articles_text += (
-            f"[{idx}] Catégorie: {art['category']} | Source: {art['source']}\n"
-            f"Titre: {art['title']}\n"
-            f"Lien: {art['link']}\n"
-            f"Extrait: {art['summary']}\n\n"
-        )
-
-    prompt = f"""
-Tu es un analyste expert en intelligence artificielle générative (LLM, modèles d'images et de vidéo).
-Voici une sélection brute d'articles et actualités des dernières 24 heures :
-
-{articles_text}
-
-Ta mission est de rédiger un condensé quotidien de veille pour un canal Telegram.
-RÈGLES DE FORMATAGE OBLIGATOIRES POUR TELEGRAM :
-- Rédige en français clair, percutant et professionnel.
-- Utilise UNIQUEMENT les balises HTML simples : <b>gras</b>, <i>italique</i>, et <a href="URL">titre du lien</a>.
-- N'entoure JAMAIS ta réponse par des blocs de code markdown (pas de ```html ni de ```).
-- Ne mets pas de crochets markdown [texte](url), utilise directement des balises HTML <a href="URL">Lien</a>.
-- Si un titre ou un mot contient une perluète (&), écris-le &amp; (ex: R&amp;D).
-- Ne répète pas les informations en doublon. Sélectionne environ 5 à 8 actus majeures au total.
-
-STRUCTURE DU MESSAGE :
-📢 <b>VEILLE IA DU JOUR | {datetime.now().strftime('%d/%m/%Y')}</b>
-
-🧠 <b>LLM &amp; Modèles de Langage</b>
-- Pour chaque actualité : <b>Titre ou Sujet</b> : explication concise de l'impact en 1 à 2 phrases. (<a href="URL">Lien</a>)
-
-🎨 <b>IA Image &amp; Vidéo Générative</b>
-- Pour chaque actualité : <b>Titre ou Sujet</b> : explication concise de l'impact en 1 à 2 phrases. (<a href="URL">Lien</a>)
-
-💡 <b>Le point clé du jour</b>
-(Une courte phrase de synthèse sur la tendance ou la percée marquante du jour).
-"""
-
+def call_gemini(prompt: str, gemini_api_key: str) -> str:
+    """Effectue un appel à Gemini avec repli sur 1.5-flash."""
     api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_api_key}"
-    
     payload = {
-        "contents": [
-            {
-                "parts": [{"text": prompt}]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 2048
-        }
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048}
     }
 
-    print("[*] Génération de la synthèse avec Gemini...")
     response = requests.post(api_url, json=payload, timeout=45)
-    
-    # Repli sur 1.5-flash si nécessaire
     if response.status_code != 200:
-        print(f"[-] Erreur {response.status_code} avec gemini-2.5-flash, essai avec gemini-1.5-flash...")
         fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_api_key}"
         response = requests.post(fallback_url, json=payload, timeout=45)
 
@@ -238,12 +186,56 @@ STRUCTURE DU MESSAGE :
         raise RuntimeError(f"Erreur API Gemini: {response.status_code} - {response.text}")
 
     data = response.json()
-    summary = data["candidates"][0]["content"]["parts"][0]["text"]
-    return summary
+    return data["candidates"][0]["content"]["parts"][0]["text"]
+
+
+def generate_category_summary(articles, category_name: str, emoji: str, gemini_api_key: str) -> str:
+    """Génère un message détaillé dédié à une catégorie spécifique avec liens cliquables."""
+    if not articles:
+        return f"{emoji} <b>VEILLE IA | {category_name.upper()}</b>\n\nAucune nouvelle mise à jour majeure dans cette catégorie aujourd'hui."
+
+    articles_text = ""
+    for idx, art in enumerate(articles, 1):
+        articles_text += (
+            f"[{idx}] Source: {art['source']}\n"
+            f"Titre: {art['title']}\n"
+            f"Lien exact: {art['link']}\n"
+            f"Extrait: {art['summary']}\n\n"
+        )
+
+    prompt = f"""
+Tu es un journaliste et expert technique en intelligence artificielle.
+Voici les actualités brutes récentes concernant la catégorie : {category_name}
+
+{articles_text}
+
+Ta mission est de rédiger un condensé complet et soigné pour Telegram.
+RÈGLES CAPITALES DE LIENS ET FORMATAGE :
+1. LE TITRE DE CHAQUE ARTICLE DOIT ÊTRE UN LIEN CLIQUABLE EN BLEU :
+   Format obligatoire :
+   🔹 <a href="URL_EXACTE"><b>Titre traduit ou résumé percutant</b></a> (Source)
+   Impact : explication claire et précise en 1 ou 2 phrases de la nouveauté.
+   🔗 <a href="URL_EXACTE">Consulter la source ↗</a>
+
+2. UTILISE UNIQUEMENT LE HTML TELEGRAM : <b>, <i>, <a href="...">.
+3. N'utilise JAMAIS de Markdown (pas de crochets [texte](url), pas d'étoiles **).
+4. N'entoure JAMAIS le texte de blocs de code ```html.
+5. Écris toute perluète (&) sous la forme &amp; (ex: R&amp;D).
+6. Sélectionne les 4 à 6 actualités les plus pertinentes de cette liste.
+
+STRUCTURE ATTENDUE :
+{emoji} <b>VEILLE IA : {category_name.upper()} | {datetime.now().strftime('%d/%m/%Y')}</b>
+
+(Insère ici les 4 à 6 actualités au format ci-dessus, séparées par un saut de ligne)
+
+💡 <b>Analyse &amp; Tendance Clé :</b>
+(Une courte réflexion de 2 phrases sur ce que ces annonces signifient concrètement pour l'écosystème).
+"""
+    return call_gemini(prompt, gemini_api_key)
 
 
 def send_to_telegram(message: str, bot_token: str, chat_id: str):
-    """Envoie le message sur Telegram avec assainissement HTML et gestion de taille."""
+    """Envoie un message sur Telegram avec assainissement HTML et gestion de taille."""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
 
     max_len = 3900
@@ -263,10 +255,7 @@ def send_to_telegram(message: str, bot_token: str, chat_id: str):
         if current_chunk:
             chunks.append(current_chunk.strip())
 
-    print(f"[*] Envoi de {len(chunks)} message(s) vers Telegram (chat_id: {chat_id})...")
-
     for i, raw_chunk in enumerate(chunks, 1):
-        # Assainissement HTML rigoureux pour Telegram
         clean_chunk = sanitize_telegram_html(raw_chunk)
 
         payload = {
@@ -277,9 +266,9 @@ def send_to_telegram(message: str, bot_token: str, chat_id: str):
         }
         res = requests.post(url, json=payload, timeout=15)
         
-        # En cas d'erreur exceptionnelle, repli propre en supprimant les balises HTML
+        # En cas d'erreur de parse HTML, repli de secours en supprimant les balises
         if res.status_code != 200:
-            print(f"[-] Erreur HTML Telegram ({res.text}), tentative d'envoi nettoyé sans balises...")
+            print(f"[-] Erreur HTML Telegram ({res.text}), repli sans balises...")
             payload["text"] = re.sub(r"<[^>]+>", "", clean_chunk)
             payload.pop("parse_mode")
             res = requests.post(url, json=payload, timeout=15)
@@ -287,7 +276,7 @@ def send_to_telegram(message: str, bot_token: str, chat_id: str):
         if res.status_code != 200:
             print(f"[-] Échec d'envoi Telegram chunk {i}: {res.status_code} - {res.text}")
         else:
-            print(f"[+] Chunk {i}/{len(chunks)} envoyé avec succès sur Telegram.")
+            print(f"[+] Message envoyé avec succès sur Telegram.")
         time.sleep(1)
 
 
@@ -298,18 +287,28 @@ def main():
 
     if not gemini_api_key or not telegram_bot_token or not telegram_chat_id:
         print("[-] ERREUR: Variables d'environnement manquantes.")
-        print("Assurez-vous de définir : GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID")
         sys.exit(1)
 
     # 1. Récupération des flux
-    articles = fetch_recent_articles(hours_back=30)
+    articles = fetch_recent_articles(hours_back=36)
     print(f"[*] Total d'articles trouvés : {len(articles)}")
 
-    # 2. Synthèse via LLM
-    summary = generate_telegram_summary_gemini(articles, gemini_api_key)
+    llm_articles = [a for a in articles if a["category"] in ["LLM", "Research"]]
+    img_articles = [a for a in articles if a["category"] in ["Image", "Research"]]
 
-    # 3. Envoi sur Telegram
-    send_to_telegram(summary, telegram_bot_token, telegram_chat_id)
+    # 2. Génération et envoi du Message 1 : LLM & Modèles de Langage
+    print("[*] Génération de la veille LLM...")
+    llm_summary = generate_category_summary(llm_articles, "LLM & Modèles de Langage", "🧠", gemini_api_key)
+    print("[*] Envoi du message LLM sur Telegram...")
+    send_to_telegram(llm_summary, telegram_bot_token, telegram_chat_id)
+    time.sleep(2)
+
+    # 3. Génération et envoi du Message 2 : IA Image & Vidéo Générative
+    print("[*] Génération de la veille Image & Vidéo Générative...")
+    img_summary = generate_category_summary(img_articles, "IA Générative Images & Vidéo", "🎨", gemini_api_key)
+    print("[*] Envoi du message Image & Vidéo sur Telegram...")
+    send_to_telegram(img_summary, telegram_bot_token, telegram_chat_id)
+
     print("[*] Veille terminée avec succès !")
 
 
