@@ -129,11 +129,25 @@ def sanitize_telegram_html(text: str) -> str:
     text = re.sub(r"</p>", "\n\n", text, flags=re.IGNORECASE)
     text = re.sub(r"<p>", "", text, flags=re.IGNORECASE)
 
-    # 3. Convertir d'éventuels résidus markdown classiques
+    # 3. Règle Telegram critique : Inverser <a ...><b>...</b></a> en <b><a ...>...</a></b>
+    text = re.sub(
+        r'<a\s+href=([\"\'"][^\"\'"]+[\"\'"])>\s*<b\s*>(.*?)</b>\s*</a>',
+        r'<b><a href=\1>\2</a></b>',
+        text,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+    text = re.sub(
+        r'<a\s+href=([\"\'"][^\"\'"]+[\"\'"])>\s*<i\s*>(.*?)</i>\s*</a>',
+        r'<i><a href=\1>\2</a></i>',
+        text,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+
+    # 4. Convertir d'éventuels résidus markdown classiques
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r'<a href="\2">\1</a>', text)
 
-    # 4. Découpage par balises HTML autorisées
+    # 5. Découpage par balises HTML autorisées
     allowed_tag_pattern = re.compile(
         r"(</?(?:b|i|u|s|code|pre|blockquote)>|<a\s+href=[\"'][^\"']*[\"']>|</a>)",
         re.IGNORECASE
@@ -198,23 +212,39 @@ def html_to_plain_text_with_links(html_text: str) -> str:
 
 
 def call_gemini(prompt: str, gemini_api_key: str) -> str:
-    """Effectue un appel à Gemini avec repli sur 1.5-flash."""
-    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_api_key}"
+    """Effectue un appel à Gemini avec modèles rapides et quota élevé."""
+    models_to_try = [
+        "gemini-3.5-flash-lite",
+        "gemini-3.5-flash",
+        "gemini-2.5-flash",
+    ]
+
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048}
+        "generationConfig": {
+            "temperature": 0.2,
+            "maxOutputTokens": 4096
+        }
     }
 
-    response = requests.post(api_url, json=payload, timeout=45)
-    if response.status_code != 200:
-        fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_api_key}"
-        response = requests.post(fallback_url, json=payload, timeout=45)
+    last_err = ""
+    for model_name in models_to_try:
+        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={gemini_api_key}"
+        try:
+            print(f"[*] Appel Gemini avec {model_name}...")
+            response = requests.post(api_url, json=payload, timeout=45)
+            if response.status_code == 200:
+                data = response.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            else:
+                print(f"[-] Erreur {response.status_code} avec {model_name}: {response.text[:120]}")
+                last_err = f"{response.status_code} - {response.text}"
+        except Exception as e:
+            print(f"[-] Exception avec {model_name}: {e}")
+            last_err = str(e)
+        time.sleep(1)
 
-    if response.status_code != 200:
-        raise RuntimeError(f"Erreur API Gemini: {response.status_code} - {response.text}")
-
-    data = response.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"]
+    raise RuntimeError(f"Toutes les tentatives Gemini ont échoué : {last_err}")
 
 
 def generate_category_summary(articles, category_name: str, emoji: str, gemini_api_key: str) -> str:
@@ -238,10 +268,10 @@ Voici les actualités brutes récentes concernant la catégorie : {category_name
 {articles_text}
 
 Ta mission est de rédiger un condensé complet et soigné pour Telegram.
-RÈGLES CAPITALES DE LIENS ET FORMATAGE :
-1. LE TITRE DE CHAQUE ARTICLE DOIT ÊTRE UN LIEN CLIQUABLE EN BLEU :
-   Format obligatoire pour chaque actualité :
-   🔹 <a href="URL_EXACTE"><b>Titre traduit ou résumé percutant</b></a> (Source)
+RÈGLES CAPITALES DE LIENS ET FORMATAGE POUR TELEGRAM :
+1. LE TITRE DE CHAQUE ARTICLE DOIT ÊTRE UN LIEN CLIQUABLE EN BLEU.
+   Règle syntaxique obligatoire pour Telegram : la balise <b> DOIT entourer la balise <a> (et NON l'inverse) :
+   🔹 <b><a href="URL_EXACTE">Titre traduit ou résumé percutant</a></b> (Source)
    Impact : explication claire et précise en 1 ou 2 phrases de la nouveauté.
    🔗 <a href="URL_EXACTE">Consulter la source ↗</a>
 
@@ -249,12 +279,12 @@ RÈGLES CAPITALES DE LIENS ET FORMATAGE :
 3. N'utilise JAMAIS de Markdown (pas de crochets [texte](url), pas d'étoiles **).
 4. N'entoure JAMAIS le texte de blocs de code ```html.
 5. Écris toute perluète (&) sous la forme &amp; (ex: R&amp;D).
-6. Sélectionne les 4 à 6 actualités les plus pertinentes de cette liste.
+6. Ne coupe pas le texte, rédige jusqu'au bout. Sélectionne les 4 à 6 actualités les plus pertinentes.
 
 STRUCTURE ATTENDUE :
 {emoji} <b>VEILLE IA : {category_name.upper()} | {datetime.now().strftime('%d/%m/%Y')}</b>
 
-(Insère ici les 4 à 6 actualités au format ci-dessus, séparées par un saut de ligne)
+(Insère ici les actualités au format ci-dessus, séparées par un saut de ligne)
 
 💡 <b>Analyse &amp; Tendance Clé :</b>
 (Une courte réflexion de 2 phrases sur ce que ces annonces signifient concrètement pour l'écosystème).
@@ -329,7 +359,7 @@ def main():
     llm_summary = generate_category_summary(llm_articles, "LLM & Modèles de Langage", "🧠", gemini_api_key)
     print("[*] Envoi du message LLM sur Telegram...")
     send_to_telegram(llm_summary, telegram_bot_token, telegram_chat_id)
-    time.sleep(2)
+    time.sleep(3)
 
     # 3. Génération et envoi du Message 2 : IA Image & Vidéo Générative
     print("[*] Génération de la veille Image & Vidéo Générative...")
