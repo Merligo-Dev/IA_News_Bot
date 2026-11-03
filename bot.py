@@ -118,16 +118,22 @@ def fetch_recent_articles(hours_back: int = 36, max_per_feed: int = 5):
 def sanitize_telegram_html(text: str) -> str:
     """Assure la conformité absolue du code HTML avec Telegram."""
     text = text.strip()
+    # 1. Enlever d'éventuels blocs de code markdown ```html ... ```
     if text.startswith("```"):
         text = re.sub(r"^```[a-zA-Z]*\s*\n?", "", text)
         text = re.sub(r"\n?\s*```$", "", text)
     text = text.strip()
 
-    # Convertir d'éventuels résidus markdown
+    # 2. Remplacer les balises parasites <br>, <p> par des sauts de ligne
+    text = re.sub(r"<(?:br|hr)\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</p>", "\n\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<p>", "", text, flags=re.IGNORECASE)
+
+    # 3. Convertir d'éventuels résidus markdown classiques
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r'<a href="\2">\1</a>', text)
 
-    # Découpage par balises HTML autorisées
+    # 4. Découpage par balises HTML autorisées
     allowed_tag_pattern = re.compile(
         r"(</?(?:b|i|u|s|code|pre|blockquote)>|<a\s+href=[\"'][^\"']*[\"']>|</a>)",
         re.IGNORECASE
@@ -152,8 +158,21 @@ def sanitize_telegram_html(text: str) -> str:
                         open_tags.pop()
                     sanitized_parts.append(token)
             elif tag_lower.startswith("<a"):
-                open_tags.append("a")
-                sanitized_parts.append(token)
+                # Interdiction de balises <a> imbriquées (erreur Telegram 400)
+                if "a" in open_tags:
+                    while open_tags and open_tags[-1] != "a":
+                        sanitized_parts.append(f"</{open_tags.pop()}>")
+                    if open_tags:
+                        open_tags.pop()
+                    sanitized_parts.append("</a>")
+
+                # Extraction et échappement sécurisé de l'URL
+                m = re.search(r'href=[\"\']([^\"\']*)[\"\']', token, re.IGNORECASE)
+                if m:
+                    raw_url = m.group(1).strip()
+                    clean_url = html.escape(html.unescape(raw_url), quote=True)
+                    open_tags.append("a")
+                    sanitized_parts.append(f'<a href="{clean_url}">')
             else:
                 tag_name = tag_lower[1:-1].strip()
                 open_tags.append(tag_name)
@@ -167,6 +186,15 @@ def sanitize_telegram_html(text: str) -> str:
         sanitized_parts.append(f"</{open_tags.pop()}>")
 
     return "".join(sanitized_parts)
+
+
+def html_to_plain_text_with_links(html_text: str) -> str:
+    """En cas de repli secours, convertit les liens HTML en liens textuels cliquables."""
+    # Convertit <a href="URL">Titre</a> -> Titre (URL)
+    text = re.sub(r'<a\s+href=[\"\']([^\"\']*)[\"\']>([^<]*)</a>', r'\2 (\1)', html_text, flags=re.IGNORECASE)
+    # Supprime toutes les autres balises HTML
+    text = re.sub(r'<[^>]+>', '', text)
+    return html.unescape(text).strip()
 
 
 def call_gemini(prompt: str, gemini_api_key: str) -> str:
@@ -212,7 +240,7 @@ Voici les actualités brutes récentes concernant la catégorie : {category_name
 Ta mission est de rédiger un condensé complet et soigné pour Telegram.
 RÈGLES CAPITALES DE LIENS ET FORMATAGE :
 1. LE TITRE DE CHAQUE ARTICLE DOIT ÊTRE UN LIEN CLIQUABLE EN BLEU :
-   Format obligatoire :
+   Format obligatoire pour chaque actualité :
    🔹 <a href="URL_EXACTE"><b>Titre traduit ou résumé percutant</b></a> (Source)
    Impact : explication claire et précise en 1 ou 2 phrases de la nouveauté.
    🔗 <a href="URL_EXACTE">Consulter la source ↗</a>
@@ -266,10 +294,10 @@ def send_to_telegram(message: str, bot_token: str, chat_id: str):
         }
         res = requests.post(url, json=payload, timeout=15)
         
-        # En cas d'erreur de parse HTML, repli de secours en supprimant les balises
+        # En cas d'erreur de parse HTML, repli intelligent conservant les liens en clair
         if res.status_code != 200:
-            print(f"[-] Erreur HTML Telegram ({res.text}), repli sans balises...")
-            payload["text"] = re.sub(r"<[^>]+>", "", clean_chunk)
+            print(f"[-] Erreur HTML Telegram ({res.text}), repli avec liens cliquables textuels...")
+            payload["text"] = html_to_plain_text_with_links(clean_chunk)
             payload.pop("parse_mode")
             res = requests.post(url, json=payload, timeout=15)
 
