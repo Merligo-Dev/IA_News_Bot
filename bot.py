@@ -7,6 +7,8 @@ Exécuté automatiquement chaque jour via GitHub Actions.
 import os
 import sys
 import time
+import re
+import html
 from datetime import datetime, timezone, timedelta
 import requests
 import feedparser
@@ -104,6 +106,69 @@ def fetch_recent_articles(hours_back: int = 30, max_per_feed: int = 4):
     return collected_articles
 
 
+def sanitize_telegram_html(text: str) -> str:
+    """
+    Assure la conformité absolue du code HTML avec l'API Telegram.
+    - Supprime les blocs de code markdown (```html)
+    - Convertit le markdown résiduel (**gras**, [lien](url)) en HTML
+    - Échappe correctement &, <, > dans le texte normal
+    - Ferme automatiquement les balises HTML orphelines
+    """
+    # 1. Enlever les balises de code Markdown au début et à la fin
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*\n?", "", text)
+        text = re.sub(r"\n?\s*```$", "", text)
+    text = text.strip()
+
+    # 2. Conversion de résidus markdown fréquents
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^\)]+)\)", r'<a href="\2">\1</a>', text)
+
+    # 3. Découpage par balises HTML autorisées par Telegram
+    allowed_tag_pattern = re.compile(
+        r"(</?(?:b|i|u|s|code|pre|blockquote)>|<a\s+href=[\"'][^\"']*[\"']>|</a>)",
+        re.IGNORECASE
+    )
+
+    tokens = allowed_tag_pattern.split(text)
+    sanitized_parts = []
+    open_tags = []
+
+    for token in tokens:
+        if allowed_tag_pattern.fullmatch(token):
+            tag_lower = token.lower()
+            if tag_lower.startswith("</"):
+                tag_name = tag_lower[2:-1].strip()
+                if open_tags and open_tags[-1] == tag_name:
+                    open_tags.pop()
+                    sanitized_parts.append(token)
+                elif tag_name in open_tags:
+                    while open_tags and open_tags[-1] != tag_name:
+                        sanitized_parts.append(f"</{open_tags.pop()}>")
+                    if open_tags:
+                        open_tags.pop()
+                    sanitized_parts.append(token)
+            elif tag_lower.startswith("<a"):
+                open_tags.append("a")
+                sanitized_parts.append(token)
+            else:
+                tag_name = tag_lower[1:-1].strip()
+                open_tags.append(tag_name)
+                sanitized_parts.append(token)
+        else:
+            # Échappement des caractères réservés hors balises
+            unescaped = html.unescape(token)
+            escaped = html.escape(unescaped, quote=False)
+            sanitized_parts.append(escaped)
+
+    # Fermeture de sécurité de toute balise restée ouverte
+    while open_tags:
+        sanitized_parts.append(f"</{open_tags.pop()}>")
+
+    return "".join(sanitized_parts)
+
+
 def generate_telegram_summary_gemini(articles, gemini_api_key: str):
     """Appelle l'API Gemini pour générer une synthèse au format HTML Telegram."""
     if not articles:
@@ -125,20 +190,22 @@ Voici une sélection brute d'articles et actualités des dernières 24 heures :
 {articles_text}
 
 Ta mission est de rédiger un condensé quotidien de veille pour un canal Telegram.
-RÈGLES DE FORMATAGE IMPORTANTES POUR TELEGRAM :
-- Écris en français clair, percutant et professionnel.
-- Utilise UNIQUEMENT les balises HTML supportées par Telegram : <b>gras</b>, <i>italique</i>, et <a href="URL">titre du lien</a>.
-- N'utilise PAS de balises Markdown (pas d'étoiles **, ni de crochets [lien](url)). Uniquement du HTML valide.
-- Ne répète pas les informations en doublon. Sélectionne les plus importantes (environ 5 à 8 actus clés au total).
+RÈGLES DE FORMATAGE OBLIGATOIRES POUR TELEGRAM :
+- Rédige en français clair, percutant et professionnel.
+- Utilise UNIQUEMENT les balises HTML simples : <b>gras</b>, <i>italique</i>, et <a href="URL">titre du lien</a>.
+- N'entoure JAMAIS ta réponse par des blocs de code markdown (pas de ```html ni de ```).
+- Ne mets pas de crochets markdown [texte](url), utilise directement des balises HTML <a href="URL">Lien</a>.
+- Si un titre ou un mot contient une perluète (&), écris-le &amp; (ex: R&amp;D).
+- Ne répète pas les informations en doublon. Sélectionne environ 5 à 8 actus majeures au total.
 
 STRUCTURE DU MESSAGE :
 📢 <b>VEILLE IA DU JOUR | {datetime.now().strftime('%d/%m/%Y')}</b>
 
-🧠 <b>LLM & Modèles de Langage</b>
-- Pour chaque actualité majeure : <b>Titre ou Sujet</b> : explication concise de l'impact en 1 à 2 phrases. (<a href="URL">Lien</a>)
+🧠 <b>LLM &amp; Modèles de Langage</b>
+- Pour chaque actualité : <b>Titre ou Sujet</b> : explication concise de l'impact en 1 à 2 phrases. (<a href="URL">Lien</a>)
 
-🎨 <b>IA Image & Vidéo Générative</b>
-- Pour chaque actualité majeure : <b>Titre ou Sujet</b> : explication concise de l'impact en 1 à 2 phrases. (<a href="URL">Lien</a>)
+🎨 <b>IA Image &amp; Vidéo Générative</b>
+- Pour chaque actualité : <b>Titre ou Sujet</b> : explication concise de l'impact en 1 à 2 phrases. (<a href="URL">Lien</a>)
 
 💡 <b>Le point clé du jour</b>
 (Une courte phrase de synthèse sur la tendance ou la percée marquante du jour).
@@ -161,7 +228,7 @@ STRUCTURE DU MESSAGE :
     print("[*] Génération de la synthèse avec Gemini...")
     response = requests.post(api_url, json=payload, timeout=45)
     
-    # En cas de modèle 2.5 non disponible, repli sur 1.5-flash
+    # Repli sur 1.5-flash si nécessaire
     if response.status_code != 200:
         print(f"[-] Erreur {response.status_code} avec gemini-2.5-flash, essai avec gemini-1.5-flash...")
         fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_api_key}"
@@ -176,11 +243,10 @@ STRUCTURE DU MESSAGE :
 
 
 def send_to_telegram(message: str, bot_token: str, chat_id: str):
-    """Envoie le message sur Telegram en gérant la limite de 4096 caractères."""
+    """Envoie le message sur Telegram avec assainissement HTML et gestion de taille."""
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
 
-    # Telegram limite chaque message à 4096 caractères
-    max_len = 4000
+    max_len = 3900
     chunks = []
     
     if len(message) <= max_len:
@@ -199,18 +265,22 @@ def send_to_telegram(message: str, bot_token: str, chat_id: str):
 
     print(f"[*] Envoi de {len(chunks)} message(s) vers Telegram (chat_id: {chat_id})...")
 
-    for i, chunk in enumerate(chunks, 1):
+    for i, raw_chunk in enumerate(chunks, 1):
+        # Assainissement HTML rigoureux pour Telegram
+        clean_chunk = sanitize_telegram_html(raw_chunk)
+
         payload = {
             "chat_id": chat_id,
-            "text": chunk,
+            "text": clean_chunk,
             "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
         res = requests.post(url, json=payload, timeout=15)
         
-        # En cas d'erreur HTML (ex: balise non fermée par le LLM), envoi de secours en texte brut
+        # En cas d'erreur exceptionnelle, repli propre en supprimant les balises HTML
         if res.status_code != 200:
-            print(f"[-] Erreur HTML Telegram ({res.text}), tentative d'envoi en texte brut...")
+            print(f"[-] Erreur HTML Telegram ({res.text}), tentative d'envoi nettoyé sans balises...")
+            payload["text"] = re.sub(r"<[^>]+>", "", clean_chunk)
             payload.pop("parse_mode")
             res = requests.post(url, json=payload, timeout=15)
 
@@ -245,4 +315,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
